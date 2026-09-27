@@ -40,11 +40,15 @@ export default function UploadPage() {
       message={upload.message}
       uploadedUrl={upload.uploadedUrl}
       progress={upload.progress}
+      errorKind={upload.errorKind}
+      canRetry={upload.canRetry}
       showSamples={showSamples}
       onToggleSamples={() => setShowSamples((visible) => !visible)}
       onFileSelect={upload.selectFile}
       onClearFile={upload.clearFile}
       onUpload={upload.upload}
+      onRetry={upload.retry}
+      onCancel={upload.cancel}
       onLogout={handleLogout}
     />
   )

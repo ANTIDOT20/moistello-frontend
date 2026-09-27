@@ -1,151 +1,88 @@
 "use client"
 
-import { useCallback, useRef, useState, type ChangeEvent } from "react"
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react"
 import { getCsrfHeaders } from "@/lib/auth/csrf"
 import { logger } from "@/lib/logger"
 import {
+  FINALIZE_TIMEOUT_MS,
+  IDLE_PROGRESS,
+  TRANSFER_TIMEOUT_MS,
   getUploadPath,
-  getUploadSlug,
   isAllowedUpload,
+  type UploadErrorKind,
+  type UploadProgress,
   type UploadStatus,
 } from "../utils/upload"
+import {
+  UploadError,
+  cancelStagedUpload,
+  finalizeUpload,
+  transferFile,
+} from "../utils/upload-transport"
 
-// Chunk size: 256 KB. Small enough to recover quickly from drops, large enough
-// to keep the chunk count reasonable for files up to the 5 MB limit.
-const CHUNK_SIZE = 256 * 1024
-
-interface UploadResponse {
-  slug?: string
-  error?: string
-}
-
-interface ChunkAckResponse {
-  uploadId: string
-  receivedChunks: number[]
-  complete?: boolean
-  slug?: string
-  error?: string
-}
-
-/** Persisted resume state keyed by file identity (name + size). */
-interface ResumeRecord {
-  uploadId: string
-  receivedChunks: number[]
-}
-
-function makeFileKey(file: File): string {
-  return `chunked-upload:${file.name}:${file.size}`
-}
-
-function loadResumeRecord(file: File): ResumeRecord | null {
-  try {
-    const raw = sessionStorage.getItem(makeFileKey(file))
-    if (!raw) return null
-    return JSON.parse(raw) as ResumeRecord
-  } catch {
-    return null
-  }
-}
-
-function saveResumeRecord(file: File, record: ResumeRecord): void {
-  try {
-    sessionStorage.setItem(makeFileKey(file), JSON.stringify(record))
-  } catch {
-    // sessionStorage may be unavailable in some contexts — swallow the error.
-  }
-}
-
-function clearResumeRecord(file: File): void {
-  try {
-    sessionStorage.removeItem(makeFileKey(file))
-  } catch {
-    // ignore
-  }
-}
-
-/** Split a file into an array of Blob chunks. */
-function sliceFile(file: File, chunkSize: number): Blob[] {
-  const chunks: Blob[] = []
-  let offset = 0
-  while (offset < file.size) {
-    chunks.push(file.slice(offset, offset + chunkSize))
-    offset += chunkSize
-  }
-  return chunks
+export interface UseUploadFileReturn {
+  file: File | null
+  status: UploadStatus
+  message: string
+  uploadedUrl: string
+  progress: UploadProgress
+  errorKind: UploadErrorKind | null
+  /** True when the failure is a finalize timeout and a retry is worth offering. */
+  canRetry: boolean
+  fileRef: React.RefObject<HTMLInputElement>
+  selectFile: (event: ChangeEvent<HTMLInputElement>) => void
+  clearFile: () => void
+  resetUpload: () => void
+  upload: () => Promise<void>
+  retry: () => Promise<void>
+  cancel: () => void
 }
 
 /**
- * Upload a single chunk to /api/upload/chunk.
+ * Drives the two-phase upload.
  *
- * Returns the updated ack from the server (list of received chunk indices).
+ * Phase 1 streams the file and reports byte progress. Phase 2 asks the server
+ * to publish what it staged. `status` only becomes `"success"` after phase 2
+ * confirms, so the progress UI can never show 100% for work the server has not
+ * finished. A phase-2 timeout leaves the staged bytes intact, which is what
+ * makes `retry` safe to expose.
  */
-async function uploadChunk(
-  uploadId: string,
-  chunkIndex: number,
-  totalChunks: number,
-  chunk: Blob,
-  fileName: string,
-  overwrite: boolean,
-): Promise<ChunkAckResponse> {
-  const body = new FormData()
-  body.append("uploadId", uploadId)
-  body.append("chunkIndex", String(chunkIndex))
-  body.append("totalChunks", String(totalChunks))
-  body.append("fileName", fileName)
-  body.append("overwrite", overwrite ? "true" : "false")
-  body.append("chunk", chunk, `${fileName}.part${chunkIndex}`)
-
-  const response = await fetch("/api/upload/chunk", {
-    method: "POST",
-    headers: getCsrfHeaders(),
-    body,
-  })
-
-  const data = (await response.json()) as ChunkAckResponse
-  if (!response.ok) {
-    throw new Error(data.error ?? "Chunk upload failed")
-  }
-  return data
-}
-
-/**
- * Single-request fallback for small files (under CHUNK_SIZE).
- *
- * Falls back to the original /api/upload endpoint so the feature is backward-
- * compatible if the chunk endpoint is not yet deployed.
- */
-async function uploadSmall(file: File): Promise<UploadResponse> {
-  const formData = new FormData()
-  formData.append("file", file)
-  const response = await fetch("/api/upload", {
-    method: "POST",
-    headers: getCsrfHeaders(),
-    body: formData,
-  })
-  return response.json() as Promise<UploadResponse>
-}
-
-export function useUploadFile() {
+export function useUploadFile(): UseUploadFileReturn {
   const [file, setFile] = useState<File | null>(null)
   const [status, setStatus] = useState<UploadStatus>("idle")
   const [message, setMessage] = useState("")
   const [uploadedUrl, setUploadedUrl] = useState("")
-  /** 0–100 upload progress for the progress bar. */
-  const [progress, setProgress] = useState(0)
+  const [progress, setProgress] = useState<UploadProgress>(IDLE_PROGRESS)
+  const [errorKind, setErrorKind] = useState<UploadErrorKind | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  /** Survives a `clearFile()` so `retry` still has bytes to finalize. */
+  const stagedRef = useRef<{ uploadId: string; file: File } | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      abortRef.current?.abort()
+    }
+  }, [])
 
   const selectFile = useCallback((event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0]
     if (!selectedFile) return
     if (!isAllowedUpload(selectedFile)) {
       setStatus("error")
+      setErrorKind("validation")
       setMessage("Only .md and .html files are allowed")
       return
     }
     setFile(selectedFile)
     setStatus("idle")
     setMessage("")
-    setProgress(0)
+    setErrorKind(null)
+    setProgress(IDLE_PROGRESS)
   }, [])
 
   const clearFile = useCallback(() => {
@@ -155,123 +92,123 @@ export function useUploadFile() {
   }, [])
 
   const resetUpload = useCallback(() => {
+    abortRef.current?.abort()
+    stagedRef.current = null
     setFile(null)
     setStatus("idle")
     setMessage("")
     setUploadedUrl("")
-    setProgress(0)
+    setErrorKind(null)
+    setProgress(IDLE_PROGRESS)
     if (fileRef.current) fileRef.current.value = ""
   }, [])
 
-  const upload = useCallback(async () => {
-    if (!file) return
-    setStatus("uploading")
+  const cancel = useCallback(() => {
+    abortRef.current?.abort()
+    const staged = stagedRef.current
+    stagedRef.current = null
+    if (staged) void cancelStagedUpload(staged.uploadId, getCsrfHeaders())
+    setStatus("idle")
     setMessage("")
+    setErrorKind(null)
+    setProgress(IDLE_PROGRESS)
+  }, [])
 
-    // Small files (≤ CHUNK_SIZE): use the simple single-request path.
-    if (file.size <= CHUNK_SIZE) {
+  /** Phase 2 on its own, so a timed-out finalize can be retried cheaply. */
+  const runFinalize = useCallback(
+    async (uploadId: string, overwrite: boolean) => {
+      const controller = new AbortController()
+      abortRef.current = controller
+      setStatus("finalizing")
+
       try {
-        const response = await uploadSmall(file)
-        if (!response.slug && !("success" in response)) {
-          setStatus("error")
-          setMessage(response.error ?? "Upload failed")
-          return
-        }
-        const slug = response.slug ?? getUploadSlug(file.name)
-        setProgress(100)
+        const result = await finalizeUpload({
+          uploadId,
+          overwrite,
+          timeoutMs: FINALIZE_TIMEOUT_MS,
+          csrfHeaders: getCsrfHeaders(),
+          signal: controller.signal,
+        })
+
+        if (!mountedRef.current) return
+        const slug = result.slug || stagedRef.current?.uploadId || ""
         setStatus("success")
-        setMessage(`Published as ${getUploadPath(slug)}`)
-        setUploadedUrl(getUploadPath(slug))
+        setProgress({ transfer: 100, finalize: 100 })
+        setErrorKind(null)
+        setMessage(`Published as ${result.url || getUploadPath(slug)}`)
+        setUploadedUrl(result.url || getUploadPath(slug))
         setFile(null)
         if (fileRef.current) fileRef.current.value = ""
-      } catch (error: unknown) {
-        logger.error("Page upload failed", { error, fileName: file.name })
+        stagedRef.current = null
+      } catch (error) {
+        if (!mountedRef.current) return
+        const uploadError =
+          error instanceof UploadError
+            ? error
+            : new UploadError("Could not publish the page", "server")
+        logger.error("Page finalize failed", { error: uploadError, uploadId })
         setStatus("error")
-        setMessage("Network error — try again")
+        setErrorKind(uploadError.kind)
+        setMessage(uploadError.message)
       }
-      return
-    }
+    },
+    [],
+  )
 
-    // Chunked upload path for larger files.
-    const chunks = sliceFile(file, CHUNK_SIZE)
-    const totalChunks = chunks.length
+  const upload = useCallback(async () => {
+    if (!file) return
 
-    // Check for an existing resume record from a previous interrupted upload.
-    let resume = loadResumeRecord(file)
-    let uploadId = resume?.uploadId ?? crypto.randomUUID()
-    const alreadyReceived = new Set<number>(resume?.receivedChunks ?? [])
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
 
-    // Restore progress bar to the already-received position.
-    if (alreadyReceived.size > 0) {
-      setProgress(Math.round((alreadyReceived.size / totalChunks) * 100))
-    }
+    setStatus("uploading")
+    setMessage("")
+    setErrorKind(null)
+    setUploadedUrl("")
+    setProgress({ transfer: 0, finalize: 0 })
 
     try {
-      for (let i = 0; i < totalChunks; i++) {
-        // Skip chunks the server already acknowledged.
-        if (alreadyReceived.has(i)) continue
-
-        const ack = await uploadChunk(
-          uploadId,
-          i,
-          totalChunks,
-          chunks[i],
-          file.name,
-          false,
-        )
-
-        // Server may reassign the uploadId on the first chunk.
-        if (ack.uploadId) uploadId = ack.uploadId
-
-        alreadyReceived.add(i)
-        saveResumeRecord(file, { uploadId, receivedChunks: [...alreadyReceived] })
-
-        setProgress(Math.round((alreadyReceived.size / totalChunks) * 100))
-
-        if (ack.complete) {
-          const slug = ack.slug ?? getUploadSlug(file.name)
-          clearResumeRecord(file)
-          setProgress(100)
-          setStatus("success")
-          setMessage(`Published as ${getUploadPath(slug)}`)
-          setUploadedUrl(getUploadPath(slug))
-          setFile(null)
-          if (fileRef.current) fileRef.current.value = ""
-          return
-        }
-      }
-
-      // All chunks sent but server hasn't emitted `complete: true` — request
-      // explicit assembly via a finalise call.
-      const finaliseBody = new FormData()
-      finaliseBody.append("uploadId", uploadId)
-      finaliseBody.append("fileName", file.name)
-      const finaliseRes = await fetch("/api/upload/finalise", {
-        method: "POST",
-        headers: getCsrfHeaders(),
-        body: finaliseBody,
+      const staged = await transferFile({
+        file,
+        timeoutMs: TRANSFER_TIMEOUT_MS,
+        csrfHeaders: getCsrfHeaders(),
+        signal: controller.signal,
+        onProgress: (percent) => {
+          if (mountedRef.current) setProgress((current) => ({ ...current, transfer: percent }))
+        },
       })
-      const finalData = (await finaliseRes.json()) as ChunkAckResponse & { slug?: string }
-      if (!finaliseRes.ok) {
-        setStatus("error")
-        setMessage(finalData.error ?? "Failed to finalise upload")
-        return
-      }
-      const slug = finalData.slug ?? getUploadSlug(file.name)
-      clearResumeRecord(file)
-      setProgress(100)
-      setStatus("success")
-      setMessage(`Published as ${getUploadPath(slug)}`)
-      setUploadedUrl(getUploadPath(slug))
-      setFile(null)
-      if (fileRef.current) fileRef.current.value = ""
-    } catch (error: unknown) {
-      logger.error("Chunked page upload failed", { error, fileName: file.name, uploadId })
+
+      if (!mountedRef.current) return
+      stagedRef.current = { uploadId: staged.uploadId, file }
+      await runFinalize(staged.uploadId, false)
+    } catch (error) {
+      if (!mountedRef.current) return
+      const uploadError =
+        error instanceof UploadError
+          ? error
+          : new UploadError("Upload failed", "network")
+      logger.error("Page upload failed", { error: uploadError, fileName: file.name })
       setStatus("error")
-      setMessage("Network error — your progress is saved, click Upload to resume")
-      // Resume record is kept so the next attempt can pick up where it left off.
+      setErrorKind(uploadError.kind)
+      setMessage(uploadError.message)
     }
-  }, [file])
+  }, [file, runFinalize])
+
+  /**
+   * Re-run whichever phase failed. A staged upload means only finalize is
+   * outstanding, so the file is never re-sent.
+   */
+  const retry = useCallback(async () => {
+    const staged = stagedRef.current
+    if (staged) {
+      await runFinalize(staged.uploadId, errorKind === "conflict")
+      return
+    }
+    await upload()
+  }, [runFinalize, upload, errorKind])
+
+  const canRetry = status === "error" && (stagedRef.current !== null || file !== null)
 
   return {
     file,
@@ -279,10 +216,14 @@ export function useUploadFile() {
     message,
     uploadedUrl,
     progress,
+    errorKind,
+    canRetry,
     fileRef,
     selectFile,
     clearFile,
     resetUpload,
     upload,
+    retry,
+    cancel,
   }
 }
