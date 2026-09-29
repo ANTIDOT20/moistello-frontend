@@ -31,8 +31,6 @@ const DEFAULT_PREFS: NotificationPreferences = {
     marketing: false,
   },
   frequency: "instant",
-  sendTime: "09:00",
-  timezone: "UTC",
 }
 
 function parsePreferences(raw: unknown): NotificationPreferences {
